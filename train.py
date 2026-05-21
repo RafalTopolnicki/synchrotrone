@@ -33,6 +33,7 @@ from pathlib import Path
 import torch
 from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
+from tqdm import tqdm
 
 import config
 from dataset import TileDataset
@@ -60,27 +61,40 @@ def make_loaders(batch_size: int):
 
 # ── training step ─────────────────────────────────────────────────────────────
 
-def run_epoch(model, loader, optimizer, device):
+def run_epoch(model, loader, optimizer, device, desc: str = ''):
     """One pass; returns per-loss averages. optimizer=None → val pass (no grad)."""
+    is_train = optimizer is not None
     model.train()   # Faster R-CNN only returns losses in train mode
     totals: dict[str, float] = {}
-    with torch.set_grad_enabled(optimizer is not None):
-        for images, targets in loader:
+    step = 0
+
+    bar = tqdm(loader, desc=desc, leave=False, dynamic_ncols=True)
+    with torch.set_grad_enabled(is_train):
+        for images, targets in bar:
             images  = [img.to(device) for img in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             loss_dict = model(images, targets)
             loss = sum(loss_dict.values())
 
-            if optimizer is not None:
+            if is_train:
                 optimizer.zero_grad()
                 loss.backward()
                 optimizer.step()
 
+            step += 1
             for k, v in loss_dict.items():
                 totals[k] = totals.get(k, 0.0) + v.item()
 
-    n = max(len(loader), 1)
+            # Running averages shown in the progress bar
+            bar.set_postfix({
+                'loss': f"{loss.item():.4f}",
+                'cls':  f"{loss_dict.get('loss_classifier', torch.tensor(0)).item():.3f}",
+                'box':  f"{loss_dict.get('loss_box_reg',    torch.tensor(0)).item():.3f}",
+                'rpn':  f"{loss_dict.get('loss_objectness', torch.tensor(0)).item():.3f}",
+            })
+
+    n = max(step, 1)
     return {k: v / n for k, v in totals.items()}
 
 
@@ -124,7 +138,7 @@ def main():
     args = parser.parse_args()
 
     # ── run directory ──────────────────────────────────────────────────────
-    run_name = datetime.now().strftime('%Y%m%d_%H%M%S')
+    run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.backbone}"
     run_dir  = Path('runs') / run_name
     ckpt_dir = run_dir / 'checkpoints'
     pred_dir = run_dir / 'predictions'
@@ -181,20 +195,27 @@ def main():
     for epoch in range(start_epoch, args.epochs + 1):
         t0 = time.time()
 
-        train_losses = run_epoch(model, train_loader, optimizer, device)
-        val_losses   = run_epoch(model, val_loader,   None,      device)
+        print(f"\n{'─'*70}")
+        print(f"Epoch {epoch:03d}/{args.epochs}  "
+              f"backbone={args.backbone}  bs={args.batch_size}  lr={optimizer.param_groups[0]['lr']:.2e}")
+
+        train_losses = run_epoch(model, train_loader, optimizer, device,
+                                 desc=f"  train {epoch:03d}")
+        val_losses   = run_epoch(model, val_loader,   None,      device,
+                                 desc=f"  val   {epoch:03d}")
         scheduler.step()
 
         train_total = sum(train_losses.values())
         val_total   = sum(val_losses.values())
         elapsed     = time.time() - t0
 
-        # ── console ──────────────────────────────────────────────────────
-        print(f"\nEpoch {epoch:03d}/{args.epochs}  "
-              f"train={train_total:.4f}  val={val_total:.4f}  ({elapsed:.0f}s)")
+        # ── console summary ───────────────────────────────────────────────
+        print(f"  {'loss':35s}  {'train':>10}  {'val':>10}")
+        print(f"  {'─'*57}")
+        print(f"  {'total':35s}  {train_total:10.4f}  {val_total:10.4f}")
         for k in train_losses:
-            print(f"  {k:35s}  train={train_losses[k]:.4f}  "
-                  f"val={val_losses.get(k, 0):.4f}")
+            print(f"  {k:35s}  {train_losses[k]:10.4f}  {val_losses.get(k, 0):10.4f}")
+        print(f"  elapsed: {elapsed:.0f}s")
 
         # ── TensorBoard scalars ───────────────────────────────────────────
         writer.add_scalars('loss/total',
