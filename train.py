@@ -6,17 +6,22 @@ Prerequisites:
 
 Usage:
     python train.py
-    python train.py --epochs 50 --lr 0.001 --batch_size 8
-    python train.py --resume runs/20260521_120000/last.pt
+    python train.py --backbone resnet50v2 --epochs 50 --lr 0.001 --batch_size 8
+    python train.py --resume runs/20260521_120000/checkpoints/last.pt
+
+Backbone choices: resnet50 (default), resnet50v2, mobilenet
 
 Each run is saved to:
     runs/<YYYYMMDD_HHMMSS>/
-        tensorboard/      ← tensorboard logs (launch with: tensorboard --logdir runs)
+        args.json
+        tensorboard/          ← tensorboard --logdir runs
         checkpoints/
-            best.pt
-            last.pt
-            history.json
-        predictions/      ← post-training visualisation tiles
+            best.pt  last.pt  history.json
+        predictions/
+            val/   pred_00.png … pred_09.png
+            test/  pred_00.png … pred_09.png
+        metrics.json          ← mAP / AP / P / R per split × class
+        per_image_stats.json  ← GT vs predicted counts per source image
 """
 
 import argparse
@@ -31,8 +36,9 @@ from torch.utils.tensorboard import SummaryWriter
 
 import config
 from dataset import TileDataset
-from model import build_model
+from model import build_model, BACKBONES
 from viz import log_sample_images, save_prediction_tiles
+from evaluate import evaluate_all_splits, compute_per_image_stats
 
 
 # ── data ─────────────────────────────────────────────────────────────────────
@@ -102,6 +108,9 @@ class EarlyStopping:
 
 def main():
     parser = argparse.ArgumentParser()
+    parser.add_argument('--backbone',    default='resnet50',
+                        choices=list(BACKBONES),
+                        help='Feature extractor backbone')
     parser.add_argument('--epochs',      type=int,   default=config.NUM_EPOCHS,
                         help='Maximum number of training epochs')
     parser.add_argument('--lr',          type=float, default=config.LR)
@@ -127,6 +136,7 @@ def main():
     (run_dir / 'args.json').write_text(json.dumps(vars(args), indent=2))
 
     print(f"Run directory : {run_dir}")
+    print(f"Backbone      : {args.backbone}")
     print(f"TensorBoard   : tensorboard --logdir runs")
 
     device = torch.device(config.DEVICE)
@@ -137,7 +147,7 @@ def main():
     print(f"Tiles — train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
     # ── model / optimiser ──────────────────────────────────────────────────
-    model = build_model(pretrained=True).to(device)
+    model = build_model(backbone=args.backbone, pretrained=True).to(device)
 
     params    = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
@@ -161,6 +171,9 @@ def main():
         start_epoch = ckpt['epoch'] + 1
         best_val    = ckpt.get('best_val', float('inf'))
         print(f"Resumed from epoch {ckpt['epoch']}")
+
+    # Store backbone name in checkpoint for reference
+    _backbone = args.backbone
 
     writer = SummaryWriter(log_dir=str(tb_dir))
 
@@ -200,7 +213,8 @@ def main():
         # ── checkpoints ───────────────────────────────────────────────────
         ckpt = dict(epoch=epoch, model=model.state_dict(),
                     optimizer=optimizer.state_dict(),
-                    val_loss=val_total, best_val=best_val)
+                    val_loss=val_total, best_val=best_val,
+                    backbone=_backbone)
         torch.save(ckpt, ckpt_dir / 'last.pt')
 
         if val_total < best_val:
@@ -221,14 +235,23 @@ def main():
 
     writer.close()
 
-    # ── post-training: visualise predictions ──────────────────────────────
-    print("\nGenerating prediction visualisations…")
+    # ── post-training: load best weights ──────────────────────────────────
+    print("\nLoading best checkpoint for evaluation…")
     best_ckpt = torch.load(ckpt_dir / 'best.pt', map_location=device)
     model.load_state_dict(best_ckpt['model'])
 
+    # ── visualise predictions ──────────────────────────────────────────────
+    print("Generating prediction visualisations…")
     for split, ds in [('val', val_ds), ('test', test_ds)]:
-        save_prediction_tiles(model, ds, device,
-                              pred_dir / split, n=10)
+        save_prediction_tiles(model, ds, device, pred_dir / split, n=10)
+
+    # ── metrics on all splits ─────────────────────────────────────────────
+    print("\nComputing metrics…")
+    evaluate_all_splits(model, device, run_dir)
+
+    # ── per-image GT vs predicted counts ──────────────────────────────────
+    print("\nComputing per-image stats…")
+    compute_per_image_stats(model, run_dir)
 
     print(f"\nDone. Best val loss: {best_val:.4f}")
     print(f"Run saved to: {run_dir}")
