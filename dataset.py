@@ -15,13 +15,18 @@ TRAIN_AUGMENTS = T.Compose([
     T.RandomEqualize(p=0.2),
 ])
 
+# Label indices for the two dune classes (1-based, background=0)
+_DUNE_DOWN_IDX = config.LABELS.index('CoR_dune_down') + 1
+_DUNE_UP_IDX   = config.LABELS.index('CoR_dune_up')   + 1
+
 
 class TileDataset(Dataset):
-    def __init__(self, split: str, augment: bool = False):
+    def __init__(self, split: str, augment: bool = False, merge_dunes: bool = False):
         with open(config.SPLITS_FILE) as f:
             index = json.load(f)
         self.tiles = index[split]
         self.augment = augment
+        self.merge_dunes = merge_dunes
 
     def __len__(self):
         return len(self.tiles)
@@ -39,6 +44,12 @@ class TileDataset(Dataset):
 
         boxes  = torch.tensor(tile['boxes'],  dtype=torch.float32)
         labels = torch.tensor(tile['labels'], dtype=torch.int64)
+
+        if self.merge_dunes and boxes.numel() > 0:
+            # Keep only dune boxes; remap both dune classes to label 1
+            dune_mask = (labels == _DUNE_DOWN_IDX) | (labels == _DUNE_UP_IDX)
+            boxes  = boxes[dune_mask]
+            labels = torch.ones(int(dune_mask.sum()), dtype=torch.int64)
 
         if boxes.numel() == 0:
             boxes  = torch.zeros((0, 4), dtype=torch.float32)

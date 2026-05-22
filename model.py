@@ -12,9 +12,12 @@ BACKBONES = {
 }
 
 
-def build_model(backbone: str = 'resnet50', pretrained: bool = True):
+def build_model(backbone: str = 'resnet50', pretrained: bool = True, num_classes: int = None):
     if backbone not in BACKBONES:
         raise ValueError(f"Unknown backbone '{backbone}'. Choose from: {list(BACKBONES)}")
+
+    if num_classes is None:
+        num_classes = config.NUM_CLASSES
 
     constructor = BACKBONES[backbone]
     model = constructor(weights='DEFAULT' if pretrained else None)
@@ -29,6 +32,6 @@ def build_model(backbone: str = 'resnet50', pretrained: bool = True):
 
     # Replace classification head for our number of classes
     in_features = model.roi_heads.box_predictor.cls_score.in_features
-    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, config.NUM_CLASSES)
+    model.roi_heads.box_predictor = FastRCNNPredictor(in_features, num_classes)
 
     return model

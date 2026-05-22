@@ -48,10 +48,10 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
-def make_loaders(batch_size: int):
-    train_ds = TileDataset('train', augment=True)
-    val_ds   = TileDataset('val',   augment=False)
-    test_ds  = TileDataset('test',  augment=False)
+def make_loaders(batch_size: int, merge_dunes: bool = False):
+    train_ds = TileDataset('train', augment=True,  merge_dunes=merge_dunes)
+    val_ds   = TileDataset('val',   augment=False, merge_dunes=merge_dunes)
+    test_ds  = TileDataset('test',  augment=False, merge_dunes=merge_dunes)
 
     kw = dict(num_workers=config.NUM_WORKERS, collate_fn=collate_fn)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  **kw)
@@ -131,6 +131,8 @@ def main():
     parser.add_argument('--batch_size',  type=int,   default=config.BATCH_SIZE)
     parser.add_argument('--patience',    type=int,   default=7,
                         help='Early stopping patience (0 = disabled)')
+    parser.add_argument('--merge_dunes', action='store_true',
+                        help='Merge CoR_dune_up and CoR_dune_down into a single CoR_dune class')
     parser.add_argument('--resume',      default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--log_img_every', type=int, default=5,
@@ -157,11 +159,12 @@ def main():
     print(f"Device        : {device}")
 
     # ── data ───────────────────────────────────────────────────────────────
-    train_loader, val_loader, train_ds, val_ds, test_ds = make_loaders(args.batch_size)
+    train_loader, val_loader, train_ds, val_ds, test_ds = make_loaders(args.batch_size, args.merge_dunes)
     print(f"Tiles — train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
     # ── model / optimiser ──────────────────────────────────────────────────
-    model = build_model(backbone=args.backbone, pretrained=True).to(device)
+    num_classes = 2 if args.merge_dunes else config.NUM_CLASSES
+    model = build_model(backbone=args.backbone, pretrained=True, num_classes=num_classes).to(device)
 
     params    = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(
@@ -268,11 +271,11 @@ def main():
 
     # ── metrics on all splits ─────────────────────────────────────────────
     print("\nComputing metrics…")
-    evaluate_all_splits(model, device, run_dir)
+    evaluate_all_splits(model, device, run_dir, merge_dunes=args.merge_dunes)
 
     # ── per-image GT vs predicted counts ──────────────────────────────────
     print("\nComputing per-image stats…")
-    compute_per_image_stats(model, run_dir)
+    compute_per_image_stats(model, run_dir, merge_dunes=args.merge_dunes)
 
     print(f"\nDone. Best val loss: {best_val:.4f}")
     print(f"Run saved to: {run_dir}")

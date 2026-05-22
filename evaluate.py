@@ -54,7 +54,8 @@ def _compute_ap(rec: list, prec: list) -> float:
 # ── tile-level mAP ────────────────────────────────────────────────────────────
 
 def compute_map(model, dataset, device,
-                iou_threshold: float = 0.5) -> dict:
+                iou_threshold: float = 0.5,
+                idx_to_label: dict = None) -> dict:
     """
     Compute per-class AP and mAP on a TileDataset.
 
@@ -67,6 +68,9 @@ def compute_map(model, dataset, device,
           }
         }
     """
+    if idx_to_label is None:
+        idx_to_label = IDX_TO_LABEL
+
     def collate(b): return tuple(zip(*b))
 
     loader = DataLoader(dataset, batch_size=4, shuffle=False,
@@ -131,7 +135,7 @@ def compute_map(model, dataset, device,
 
         ap = _compute_ap(rec_list, prec_list)
         aps.append(ap)
-        label = IDX_TO_LABEL.get(cls_idx, str(cls_idx))
+        label = idx_to_label.get(cls_idx, str(cls_idx))
         result_per_class[label] = {
             'AP':        round(ap, 4),
             'precision': round(prec_list[-1] if prec_list else 0.0, 4),
@@ -149,7 +153,8 @@ def compute_map(model, dataset, device,
 # ── per-image stats (full-image inference + NMS) ─────────────────────────────
 
 def compute_per_image_stats(model, run_dir: Path,
-                             score_threshold: float = None) -> list[dict]:
+                             score_threshold: float = None,
+                             merge_dunes: bool = False) -> list[dict]:
     """
     For every source image (across all splits):
       - GT counts from annotation file
@@ -158,6 +163,9 @@ def compute_per_image_stats(model, run_dir: Path,
     Writes run_dir/per_image_stats.json and returns the list.
     """
     score_threshold = score_threshold or config.SCORE_THRESHOLD
+    _raw_dune_labels = {'CoR_dune_down', 'CoR_dune_up'}
+    labels_to_report = ['CoR_dune'] if merge_dunes else config.LABELS
+    idx_to_label     = {1: 'CoR_dune'} if merge_dunes else IDX_TO_LABEL
 
     with open(config.SPLITS_FILE) as f:
         split_index = json.load(f)
@@ -188,7 +196,10 @@ def compute_per_image_stats(model, run_dir: Path,
         gt_counts: dict[str, int] = defaultdict(int)
         for shape in ann['shapes']:
             lbl = shape['label']
-            if lbl in LABEL_TO_IDX:
+            if merge_dunes:
+                if lbl in _raw_dune_labels:
+                    gt_counts['CoR_dune'] += 1
+            elif lbl in LABEL_TO_IDX:
                 gt_counts[lbl] += 1
 
         # ── full-image inference ─────────────────────────────────────────
@@ -232,14 +243,14 @@ def compute_per_image_stats(model, run_dir: Path,
                 mask  = all_labels_t == cls
                 kept  = nms(all_boxes_t[mask], all_scores_t[mask],
                             config.NMS_IOU_THRESHOLD)
-                lbl   = IDX_TO_LABEL.get(int(cls), str(int(cls)))
+                lbl   = idx_to_label.get(int(cls), str(int(cls)))
                 pred_counts[lbl] = int(len(kept))
 
         row = {
             'image': stem,
             'split': split,
-            'gt':   {lbl: int(gt_counts.get(lbl, 0))   for lbl in config.LABELS},
-            'pred': {lbl: int(pred_counts.get(lbl, 0))  for lbl in config.LABELS},
+            'gt':   {lbl: int(gt_counts.get(lbl, 0))   for lbl in labels_to_report},
+            'pred': {lbl: int(pred_counts.get(lbl, 0))  for lbl in labels_to_report},
         }
         results.append(row)
         print(f"  [{split:5s}] {stem}")
@@ -254,17 +265,19 @@ def compute_per_image_stats(model, run_dir: Path,
 
 # ── convenience: evaluate all splits ─────────────────────────────────────────
 
-def evaluate_all_splits(model, device, run_dir: Path) -> dict:
+def evaluate_all_splits(model, device, run_dir: Path, merge_dunes: bool = False) -> dict:
     """
     Compute mAP on train / val / test and write run_dir/metrics.json.
     """
     from dataset import TileDataset
 
+    idx_to_label = {1: 'CoR_dune'} if merge_dunes else IDX_TO_LABEL
+
     all_metrics = {}
     for split in ('train', 'val', 'test'):
         print(f"\nEvaluating {split} split …")
-        ds = TileDataset(split, augment=False)
-        all_metrics[split] = compute_map(model, ds, device)
+        ds = TileDataset(split, augment=False, merge_dunes=merge_dunes)
+        all_metrics[split] = compute_map(model, ds, device, idx_to_label=idx_to_label)
         m = all_metrics[split]
         print(f"  mAP@0.5 = {m['mAP']:.4f}")
         for lbl, vals in m['per_class'].items():
