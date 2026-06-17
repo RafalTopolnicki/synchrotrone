@@ -22,6 +22,10 @@ CLASS_COLORS = {
 }
 IDX_TO_LABEL = {i + 1: l for i, l in enumerate(config.LABELS)}
 
+# In merge_dunes mode: GT is blue (class 1 colour), predictions are red
+MERGE_GT_COLOR   = '#2196F3'
+MERGE_PRED_COLOR = '#F44336'
+
 
 def _draw_rect(ax, x1, y1, x2, y2, color, linestyle, linewidth=1.5):
     ax.add_patch(mpatches.Rectangle(
@@ -32,23 +36,25 @@ def _draw_rect(ax, x1, y1, x2, y2, color, linestyle, linewidth=1.5):
 
 
 def draw_tile(ax, img_tensor, gt_boxes, gt_labels,
-              pred_boxes=None, pred_labels=None, pred_scores=None):
+              pred_boxes=None, pred_labels=None, pred_scores=None,
+              merge_dunes=False):
     """
     Render one tile on *ax*.
       GT boxes   — solid lines
       Pred boxes — dashed lines, score shown above box
+    In merge_dunes mode predictions are drawn in red regardless of class.
     """
     arr = img_tensor.permute(1, 2, 0).cpu().numpy()
     gray = (arr[:, :, 0] * 255).astype(np.uint8)
     ax.imshow(gray, cmap='gray', vmin=0, vmax=255)
 
     for box, lbl in zip(gt_boxes, gt_labels):
-        color = CLASS_COLORS.get(int(lbl), '#FFFFFF')
+        color = MERGE_GT_COLOR if merge_dunes else CLASS_COLORS.get(int(lbl), '#FFFFFF')
         _draw_rect(ax, *box, color, 'solid')
 
     if pred_boxes is not None:
         for box, lbl, score in zip(pred_boxes, pred_labels, pred_scores):
-            color = CLASS_COLORS.get(int(lbl), '#FFFFFF')
+            color = MERGE_PRED_COLOR if merge_dunes else CLASS_COLORS.get(int(lbl), '#FFFFFF')
             _draw_rect(ax, *box, color, 'dashed')
             ax.text(box[0], box[1] - 2, f'{score:.2f}',
                     color=color, fontsize=5, va='bottom',
@@ -57,8 +63,15 @@ def draw_tile(ax, img_tensor, gt_boxes, gt_labels,
     ax.axis('off')
 
 
-def make_legend_handles():
+def make_legend_handles(merge_dunes=False):
     """Line2D handles for all classes × {GT solid, pred dashed}."""
+    if merge_dunes:
+        return [
+            mlines.Line2D([], [], color=MERGE_GT_COLOR,   linewidth=1.5,
+                          linestyle='solid',  label='CoR_dune GT'),
+            mlines.Line2D([], [], color=MERGE_PRED_COLOR, linewidth=1.5,
+                          linestyle='dashed', label='CoR_dune pred'),
+        ]
     handles = []
     for idx, label in IDX_TO_LABEL.items():
         c = CLASS_COLORS.get(idx, '#FFFFFF')
@@ -80,7 +93,7 @@ def fig_to_chw_tensor(fig) -> torch.Tensor:
 
 
 def save_prediction_tiles(model, dataset, device, out_dir,
-                           n=10, score_threshold=None):
+                           n=10, score_threshold=None, merge_dunes=False):
     """
     Save up to *n* tiles (those with GT annotations) showing:
       - GT boxes as solid lines
@@ -107,11 +120,12 @@ def save_prediction_tiles(model, dataset, device, out_dir,
                 preds['boxes'][keep].cpu().numpy(),
                 preds['labels'][keep].cpu().numpy(),
                 preds['scores'][keep].cpu().numpy(),
+                merge_dunes=merge_dunes,
             )
             tile_name = Path(dataset.tiles[idx]['tile_path']).stem
             ax.set_title(tile_name, fontsize=7)
 
-            legend = make_legend_handles()
+            legend = make_legend_handles(merge_dunes=merge_dunes)
             ax.legend(handles=legend, loc='upper right', fontsize=5,
                       framealpha=0.8, ncol=2)
 
@@ -123,7 +137,7 @@ def save_prediction_tiles(model, dataset, device, out_dir,
 
 
 def log_sample_images(writer, tag, model, dataset, device,
-                      global_step, n=4, score_threshold=None):
+                      global_step, n=4, score_threshold=None, merge_dunes=False):
     """Log a row of tiles with GT + predictions to TensorBoard."""
     score_threshold = score_threshold or config.SCORE_THRESHOLD
     indices = [i for i, t in enumerate(dataset.tiles) if t['labels']][:n]
@@ -146,9 +160,10 @@ def log_sample_images(writer, tag, model, dataset, device,
                 preds['boxes'][keep].cpu().numpy(),
                 preds['labels'][keep].cpu().numpy(),
                 preds['scores'][keep].cpu().numpy(),
+                merge_dunes=merge_dunes,
             )
 
-    handles = make_legend_handles()
+    handles = make_legend_handles(merge_dunes=merge_dunes)
     fig.legend(handles=handles, loc='lower center', ncol=4, fontsize=6,
                bbox_to_anchor=(0.5, -0.01))
     fig.tight_layout()

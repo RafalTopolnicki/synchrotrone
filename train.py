@@ -48,8 +48,8 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
-def make_loaders(batch_size: int, merge_dunes: bool = False):
-    train_ds = TileDataset('train', augment=True,  merge_dunes=merge_dunes)
+def make_loaders(batch_size: int, merge_dunes: bool = False, rot180: bool = False):
+    train_ds = TileDataset('train', augment=True,  merge_dunes=merge_dunes, rot180=rot180)
     val_ds   = TileDataset('val',   augment=False, merge_dunes=merge_dunes)
     test_ds  = TileDataset('test',  augment=False, merge_dunes=merge_dunes)
 
@@ -122,7 +122,7 @@ class EarlyStopping:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument('--backbone',    default='resnet50',
+    parser.add_argument('--backbone',    default='resnet50v2',
                         choices=list(BACKBONES),
                         help='Feature extractor backbone')
     parser.add_argument('--epochs',      type=int,   default=config.NUM_EPOCHS,
@@ -131,16 +131,36 @@ def main():
     parser.add_argument('--batch_size',  type=int,   default=config.BATCH_SIZE)
     parser.add_argument('--patience',    type=int,   default=7,
                         help='Early stopping patience (0 = disabled)')
-    parser.add_argument('--merge_dunes', action='store_true',
-                        help='Merge CoR_dune_up and CoR_dune_down into a single CoR_dune class')
+    parser.add_argument('--merge_dunes', action='store_true', default=True,
+                        help='Merge CoR_dune_up and CoR_dune_down into a single CoR_dune class (default: on)')
+    parser.add_argument('--no_merge_dunes', action='store_false', dest='merge_dunes',
+                        help='Disable dune class merging')
+    parser.add_argument('--rot180', action='store_true', default=True,
+                        help='Add random 180° rotation to training augmentation (default: on)')
+    parser.add_argument('--no_rot180', action='store_false', dest='rot180',
+                        help='Disable 180° rotation augmentation')
+    parser.add_argument('--weight_decay', type=float, default=config.LR_WEIGHT_DECAY,
+                        help='Optimizer weight decay (default: config.LR_WEIGHT_DECAY)')
+    parser.add_argument('--name', default='',
+                        help='Descriptive suffix appended to the run directory name')
+    parser.add_argument('--freeze_epochs', type=int, default=10,
+                        help='Freeze backbone for this many epochs then unfreeze (0 = train all layers)')
+    parser.add_argument('--save_checkpoints', action='store_true',
+                        help='Save best.pt and last.pt to disk (default: off)')
     parser.add_argument('--resume',      default=None,
                         help='Path to checkpoint to resume from')
     parser.add_argument('--log_img_every', type=int, default=5,
                         help='Log sample images to TensorBoard every N epochs')
+    parser.add_argument('--score_threshold', type=float, default=0.05,
+                        help='Minimum score for a box to be kept (box_score_thresh in Faster R-CNN)')
+    parser.add_argument('--eval_only', action='store_true',
+                        help='Skip training; load --resume checkpoint and run evaluation only')
     args = parser.parse_args()
 
     # ── run directory ──────────────────────────────────────────────────────
     run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.backbone}"
+    if args.name:
+        run_name = f"{run_name}_{args.name}"
     run_dir  = Path('runs') / run_name
     ckpt_dir = run_dir / 'checkpoints'
     pred_dir = run_dir / 'predictions'
@@ -159,27 +179,36 @@ def main():
     print(f"Device        : {device}")
 
     # ── data ───────────────────────────────────────────────────────────────
-    train_loader, val_loader, train_ds, val_ds, test_ds = make_loaders(args.batch_size, args.merge_dunes)
+    train_loader, val_loader, train_ds, val_ds, test_ds = make_loaders(args.batch_size, args.merge_dunes, args.rot180)
     print(f"Tiles — train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
     # ── model / optimiser ──────────────────────────────────────────────────
     num_classes = 2 if args.merge_dunes else config.NUM_CLASSES
-    model = build_model(backbone=args.backbone, pretrained=True, num_classes=num_classes).to(device)
+    model = build_model(backbone=args.backbone, pretrained=True, num_classes=num_classes,
+                        box_score_thresh=args.score_threshold).to(device)
 
-    params    = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(
-        params, lr=args.lr,
-        momentum=config.LR_MOMENTUM,
-        weight_decay=config.LR_WEIGHT_DECAY,
-    )
-    scheduler = torch.optim.lr_scheduler.StepLR(
-        optimizer, step_size=config.LR_STEP_SIZE, gamma=config.LR_GAMMA,
-    )
+    def _make_optimizer(lr):
+        params = [p for p in model.parameters() if p.requires_grad]
+        return torch.optim.AdamW(params, lr=lr, weight_decay=args.weight_decay)
+
+    def _make_scheduler(opt):
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt, mode='min', factor=0.5, patience=5, min_lr=1e-6)
+
+    if args.freeze_epochs > 0:
+        for name, p in model.named_parameters():
+            if 'backbone' in name:
+                p.requires_grad = False
+        print(f"Backbone frozen for first {args.freeze_epochs} epochs")
+
+    optimizer = _make_optimizer(args.lr)
+    scheduler = _make_scheduler(optimizer)
     stopper   = EarlyStopping(args.patience)
 
-    start_epoch = 1
-    best_val    = float('inf')
-    history     = []
+    start_epoch      = 1
+    best_val         = float('inf')
+    best_model_state = None
+    history          = []
 
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
@@ -195,8 +224,19 @@ def main():
     writer = SummaryWriter(log_dir=str(tb_dir))
 
     # ── training loop ──────────────────────────────────────────────────────
-    for epoch in range(start_epoch, args.epochs + 1):
+    if args.eval_only:
+        print("Eval-only mode — skipping training, using loaded checkpoint weights")
+
+    for epoch in range(start_epoch if not args.eval_only else args.epochs + 1, args.epochs + 1):
         t0 = time.time()
+
+        # Unfreeze backbone after freeze_epochs
+        if args.freeze_epochs > 0 and epoch == args.freeze_epochs + 1:
+            for p in model.parameters():
+                p.requires_grad = True
+            optimizer = _make_optimizer(args.lr)
+            scheduler = _make_scheduler(optimizer)
+            print("Backbone unfrozen — all layers now training")
 
         print(f"\n{'─'*70}")
         print(f"Epoch {epoch:03d}/{args.epochs}  "
@@ -206,11 +246,12 @@ def main():
                                  desc=f"  train {epoch:03d}")
         val_losses   = run_epoch(model, val_loader,   None,      device,
                                  desc=f"  val   {epoch:03d}")
-        scheduler.step()
 
         train_total = sum(train_losses.values())
         val_total   = sum(val_losses.values())
         elapsed     = time.time() - t0
+
+        scheduler.step(val_total)
 
         # ── console summary ───────────────────────────────────────────────
         print(f"  {'loss':35s}  {'train':>10}  {'val':>10}")
@@ -232,20 +273,28 @@ def main():
         # ── TensorBoard images ────────────────────────────────────────────
         if epoch % args.log_img_every == 0 or epoch == 1:
             log_sample_images(writer, 'val/predictions', model,
-                              val_ds, device, epoch, n=4)
+                              val_ds, device, epoch, n=4,
+                              merge_dunes=args.merge_dunes)
 
         # ── checkpoints ───────────────────────────────────────────────────
-        ckpt = dict(epoch=epoch, model=model.state_dict(),
-                    optimizer=optimizer.state_dict(),
-                    val_loss=val_total, best_val=best_val,
-                    backbone=_backbone)
-        torch.save(ckpt, ckpt_dir / 'last.pt')
-
         if val_total < best_val:
-            best_val    = val_total
-            ckpt['best_val'] = best_val
-            torch.save(ckpt, ckpt_dir / 'best.pt')
-            print(f"  *** new best val={best_val:.4f} — saved best.pt")
+            best_val         = val_total
+            best_model_state = {k: v.clone() for k, v in model.state_dict().items()}
+            if args.save_checkpoints:
+                ckpt = dict(epoch=epoch, model=model.state_dict(),
+                            optimizer=optimizer.state_dict(),
+                            val_loss=val_total, best_val=best_val,
+                            backbone=_backbone)
+                torch.save(ckpt, ckpt_dir / 'best.pt')
+            print(f"  *** new best val={best_val:.4f}"
+                  + (" — saved best.pt" if args.save_checkpoints else ""))
+
+        if args.save_checkpoints:
+            ckpt = dict(epoch=epoch, model=model.state_dict(),
+                        optimizer=optimizer.state_dict(),
+                        val_loss=val_total, best_val=best_val,
+                        backbone=_backbone)
+            torch.save(ckpt, ckpt_dir / 'last.pt')
 
         row = {'epoch': epoch, 'train': train_losses, 'val': val_losses}
         history.append(row)
@@ -260,14 +309,19 @@ def main():
     writer.close()
 
     # ── post-training: load best weights ──────────────────────────────────
-    print("\nLoading best checkpoint for evaluation…")
-    best_ckpt = torch.load(ckpt_dir / 'best.pt', map_location=device)
-    model.load_state_dict(best_ckpt['model'])
+    if not args.eval_only:
+        print("\nLoading best weights for evaluation…")
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+        elif args.save_checkpoints:
+            best_ckpt = torch.load(ckpt_dir / 'best.pt', map_location=device)
+            model.load_state_dict(best_ckpt['model'])
 
     # ── visualise predictions ──────────────────────────────────────────────
     print("Generating prediction visualisations…")
     for split, ds in [('val', val_ds), ('test', test_ds)]:
-        save_prediction_tiles(model, ds, device, pred_dir / split, n=10)
+        save_prediction_tiles(model, ds, device, pred_dir / split, n=10,
+                              merge_dunes=args.merge_dunes)
 
     # ── metrics on all splits ─────────────────────────────────────────────
     print("\nComputing metrics…")

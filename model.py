@@ -12,7 +12,8 @@ BACKBONES = {
 }
 
 
-def build_model(backbone: str = 'resnet50', pretrained: bool = True, num_classes: int = None):
+def build_model(backbone: str = 'resnet50', pretrained: bool = True, num_classes: int = None,
+                box_score_thresh: float = 0.05):
     if backbone not in BACKBONES:
         raise ValueError(f"Unknown backbone '{backbone}'. Choose from: {list(BACKBONES)}")
 
@@ -20,7 +21,7 @@ def build_model(backbone: str = 'resnet50', pretrained: bool = True, num_classes
         num_classes = config.NUM_CLASSES
 
     constructor = BACKBONES[backbone]
-    model = constructor(weights='DEFAULT' if pretrained else None)
+    model = constructor(weights='DEFAULT' if pretrained else None, box_score_thresh=box_score_thresh)
 
     # Match anchor tuple count to the actual number of FPN levels in this backbone
     num_levels = len(model.rpn.anchor_generator.sizes)

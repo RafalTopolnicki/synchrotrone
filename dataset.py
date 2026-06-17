@@ -1,4 +1,5 @@
 import json
+import random
 import torch
 from torch.utils.data import Dataset
 from PIL import Image
@@ -21,12 +22,13 @@ _DUNE_UP_IDX   = config.LABELS.index('CoR_dune_up')   + 1
 
 
 class TileDataset(Dataset):
-    def __init__(self, split: str, augment: bool = False, merge_dunes: bool = False):
+    def __init__(self, split: str, augment: bool = False, merge_dunes: bool = False, rot180: bool = False):
         with open(config.SPLITS_FILE) as f:
             index = json.load(f)
         self.tiles = index[split]
         self.augment = augment
         self.merge_dunes = merge_dunes
+        self.rot180 = rot180
 
     def __len__(self):
         return len(self.tiles)
@@ -54,6 +56,22 @@ class TileDataset(Dataset):
         if boxes.numel() == 0:
             boxes  = torch.zeros((0, 4), dtype=torch.float32)
             labels = torch.zeros((0,),   dtype=torch.int64)
+
+        if self.augment:
+            _, H, W = img_t.shape
+            if random.random() > 0.5:
+                img_t = TF.hflip(img_t)
+                if boxes.numel() > 0:
+                    boxes[:, [0, 2]] = W - boxes[:, [2, 0]]
+            if random.random() > 0.5:
+                img_t = TF.vflip(img_t)
+                if boxes.numel() > 0:
+                    boxes[:, [1, 3]] = H - boxes[:, [3, 1]]
+            if self.rot180 and random.random() > 0.5:
+                img_t = TF.rotate(img_t, 180)
+                if boxes.numel() > 0:
+                    boxes[:, [0, 2]] = W - boxes[:, [2, 0]]
+                    boxes[:, [1, 3]] = H - boxes[:, [3, 1]]
 
         target = {
             'boxes':    boxes,
