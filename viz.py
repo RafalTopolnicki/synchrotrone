@@ -22,6 +22,14 @@ CLASS_COLORS = {
 }
 IDX_TO_LABEL = {i + 1: l for i, l in enumerate(config.LABELS)}
 
+# A class_mode renumbers the classes, so the legend must follow it rather than
+# assume config.LABELS order; train.py calls set_classes() once at startup.
+def set_classes(idx_to_label: dict) -> None:
+    global IDX_TO_LABEL, CLASS_COLORS
+    IDX_TO_LABEL = dict(idx_to_label)
+    palette = ['#2196F3', '#F44336', '#4CAF50', '#FF9800']
+    CLASS_COLORS = {i: palette[(i - 1) % len(palette)] for i in IDX_TO_LABEL}
+
 # In merge_dunes mode: GT is blue (class 1 colour), predictions are red
 MERGE_GT_COLOR   = '#2196F3'
 MERGE_PRED_COLOR = '#F44336'

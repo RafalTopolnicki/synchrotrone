@@ -35,10 +35,12 @@ from torch.utils.data import DataLoader
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+import classes
 import config
 import splits
 from dataset import TileDataset
 from model import build_model, BACKBONES
+import viz
 from viz import log_sample_images, save_prediction_tiles
 from evaluate import evaluate_all_splits, compute_per_image_stats
 
@@ -49,10 +51,12 @@ def collate_fn(batch):
     return tuple(zip(*batch))
 
 
-def make_loaders(batch_size: int, merge_dunes: bool = False, rot180: bool = False):
-    train_ds = TileDataset('train', augment=True,  merge_dunes=merge_dunes, rot180=rot180)
-    val_ds   = TileDataset('val',   augment=False, merge_dunes=merge_dunes)
-    test_ds  = TileDataset('test',  augment=False, merge_dunes=merge_dunes)
+def make_loaders(batch_size: int, class_mode: str, rot180: bool = False,
+                 flips: bool = True):
+    kw = dict(class_mode=class_mode)
+    train_ds = TileDataset('train', augment=True,  rot180=rot180, flips=flips, **kw)
+    val_ds   = TileDataset('val',   augment=False, **kw)
+    test_ds  = TileDataset('test',  augment=False, **kw)
 
     kw = dict(num_workers=config.NUM_WORKERS, collate_fn=collate_fn)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True,  **kw)
@@ -155,7 +159,12 @@ def main():
     parser.add_argument('--merge_dunes', action='store_true', default=True,
                         help='Merge CoR_dune_up and CoR_dune_down into a single CoR_dune class (default: on)')
     parser.add_argument('--no_merge_dunes', action='store_false', dest='merge_dunes',
-                        help='Disable dune class merging')
+                        help='Disable dune class merging (same as --class_mode all)')
+    classes.add_cli_args(parser)
+    parser.add_argument('--no_flips', action='store_false', dest='flips',
+                        help='Disable horizontal/vertical flip augmentation. Needed when the '
+                             'classes encode direction (dune_up vs dune_down): a flip turns '
+                             'one into the other while the label stays put.')
     parser.add_argument('--rot180', action='store_true', default=True,
                         help='Add random 180° rotation to training augmentation (default: on)')
     parser.add_argument('--no_rot180', action='store_false', dest='rot180',
@@ -178,6 +187,18 @@ def main():
                         help='Skip training; load --resume checkpoint and run evaluation only')
     splits.add_cli_args(parser)
     args = parser.parse_args()
+
+    # ── classes ────────────────────────────────────────────────────────────
+    # --class_mode wins; --merge_dunes/--no_merge_dunes stay as the old form.
+    args.class_mode = args.class_mode or classes.from_merge_dunes(args.merge_dunes)
+    args.merge_dunes = (args.class_mode == 'dune')
+    print(f"Classes       : {classes.describe(args.class_mode)}")
+    viz.set_classes(classes.idx_to_label(args.class_mode))
+    if classes.is_direction_sensitive(args.class_mode) and (args.flips or args.rot180):
+        on = [n for n, v in (('flips', args.flips), ('rot180', args.rot180)) if v]
+        print(f"  WARNING: {args.class_mode} separates dune_up from dune_down, but "
+              f"{' and '.join(on)} augmentation is on. Mirroring a dune makes it look like "
+              f"the other class while keeping its label. Use --no_flips --no_rot180.")
 
     # ── split policy ───────────────────────────────────────────────────────
     # Resolved once, before any dataset is built, so train/val/test agree.
@@ -213,11 +234,12 @@ def main():
     print(f"Device        : {device}")
 
     # ── data ───────────────────────────────────────────────────────────────
-    train_loader, val_loader, train_ds, val_ds, test_ds = make_loaders(args.batch_size, args.merge_dunes, args.rot180)
+    train_loader, val_loader, train_ds, val_ds, test_ds = make_loaders(
+        args.batch_size, args.class_mode, args.rot180, args.flips)
     print(f"Tiles — train: {len(train_ds)}  val: {len(val_ds)}  test: {len(test_ds)}")
 
     # ── model / optimiser ──────────────────────────────────────────────────
-    num_classes = 2 if args.merge_dunes else config.NUM_CLASSES
+    num_classes = classes.num_classes(args.class_mode)
     model = build_model(backbone=args.backbone, pretrained=True, num_classes=num_classes,
                         box_score_thresh=args.score_threshold).to(device)
 
@@ -359,11 +381,11 @@ def main():
 
     # ── metrics on all splits ─────────────────────────────────────────────
     print("\nComputing metrics…")
-    evaluate_all_splits(model, device, run_dir, merge_dunes=args.merge_dunes)
+    evaluate_all_splits(model, device, run_dir, class_mode=args.class_mode)
 
     # ── per-image GT vs predicted counts ──────────────────────────────────
     print("\nComputing per-image stats…")
-    compute_per_image_stats(model, run_dir, merge_dunes=args.merge_dunes)
+    compute_per_image_stats(model, run_dir, class_mode=args.class_mode)
 
     print(f"\nDone. Best val loss: {best_val:.4f}")
     print(f"Run saved to: {run_dir}")

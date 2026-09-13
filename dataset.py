@@ -5,6 +5,7 @@ from PIL import Image
 import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
+import classes
 import config
 import splits
 
@@ -22,11 +23,16 @@ _DUNE_UP_IDX   = config.LABELS.index('CoR_dune_up')   + 1
 
 
 class TileDataset(Dataset):
-    def __init__(self, split: str, augment: bool = False, merge_dunes: bool = False, rot180: bool = False):
+    def __init__(self, split: str, augment: bool = False, merge_dunes: bool = False,
+                 rot180: bool = False, class_mode: str = None, flips: bool = True):
         self.tiles = splits.load(split)
         self.augment = augment
+        # merge_dunes is the old boolean form of class_mode; class_mode wins.
+        self.class_mode = class_mode or classes.from_merge_dunes(merge_dunes)
+        self.remap = classes.remap(self.class_mode)
         self.merge_dunes = merge_dunes
         self.rot180 = rot180
+        self.flips = flips
 
     def __len__(self):
         return len(self.tiles)
@@ -45,11 +51,13 @@ class TileDataset(Dataset):
         boxes  = torch.tensor(tile['boxes'],  dtype=torch.float32)
         labels = torch.tensor(tile['labels'], dtype=torch.int64)
 
-        if self.merge_dunes and boxes.numel() > 0:
-            # Keep only dune boxes; remap both dune classes to label 1
-            dune_mask = (labels == _DUNE_DOWN_IDX) | (labels == _DUNE_UP_IDX)
-            boxes  = boxes[dune_mask]
-            labels = torch.ones(int(dune_mask.sum()), dtype=torch.int64)
+        if boxes.numel() > 0:
+            # Drop labels this class_mode does not train on, renumber the rest
+            keep = torch.tensor([int(l) in self.remap for l in labels.tolist()],
+                                dtype=torch.bool)
+            boxes  = boxes[keep]
+            labels = torch.tensor([self.remap[int(l)] for l in labels[keep].tolist()],
+                                  dtype=torch.int64)
 
         if boxes.numel() == 0:
             boxes  = torch.zeros((0, 4), dtype=torch.float32)
@@ -57,11 +65,11 @@ class TileDataset(Dataset):
 
         if self.augment:
             _, H, W = img_t.shape
-            if random.random() > 0.5:
+            if self.flips and random.random() > 0.5:
                 img_t = TF.hflip(img_t)
                 if boxes.numel() > 0:
                     boxes[:, [0, 2]] = W - boxes[:, [2, 0]]
-            if random.random() > 0.5:
+            if self.flips and random.random() > 0.5:
                 img_t = TF.vflip(img_t)
                 if boxes.numel() > 0:
                     boxes[:, [1, 3]] = H - boxes[:, [3, 1]]

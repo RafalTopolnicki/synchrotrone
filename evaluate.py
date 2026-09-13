@@ -17,6 +17,7 @@ import torchvision.transforms.functional as TF
 from PIL import Image
 from tqdm import tqdm
 
+import classes
 import config
 import splits
 from data_prep import tile_positions, open_as_uint8
@@ -151,11 +152,57 @@ def compute_map(model, dataset, device,
     }
 
 
+# ── point records (for point_metrics) ────────────────────────────────────────
+
+def collect_points(model, dataset, device, batch_size: int = 4) -> list[dict]:
+    """Run the detector over a split and emit one point record per tile.
+
+    Boxes are reduced to their centres, so the output is directly comparable
+    with a heatmap/density model's peaks — see point_metrics. Nothing is
+    thresholded here: the score is carried through so an operating point can be
+    chosen afterwards.
+    """
+    def collate(b): return tuple(zip(*b))
+
+    loader = DataLoader(dataset, batch_size=batch_size, shuffle=False,
+                        num_workers=config.NUM_WORKERS, collate_fn=collate)
+
+    records: list[dict] = []
+    model.eval()
+    with torch.no_grad():
+        for images, targets in tqdm(loader, desc='  collecting points',
+                                    leave=False, dynamic_ncols=True):
+            preds_list = model([img.to(device) for img in images])
+
+            for target, preds in zip(targets, preds_list):
+                # shuffle=False, so tile i of the loader is dataset.tiles[i]
+                tile = dataset.tiles[len(records)]
+                pb = preds['boxes'].cpu()
+                gb = target['boxes'].cpu()
+                records.append({
+                    'source_image': tile['source_image'],
+                    'tx': tile['tx'],
+                    'ty': tile['ty'],
+                    'pred_pts':    _centres(pb),
+                    'pred_scores': preds['scores'].cpu().tolist(),
+                    'pred_labels': preds['labels'].cpu().tolist(),
+                    'gt_pts':      _centres(gb),
+                })
+    return records
+
+
+def _centres(boxes: torch.Tensor) -> list[list[float]]:
+    if boxes.numel() == 0:
+        return []
+    return torch.stack([(boxes[:, 0] + boxes[:, 2]) / 2,
+                        (boxes[:, 1] + boxes[:, 3]) / 2], dim=1).tolist()
+
+
 # ── per-image stats (full-image inference + NMS) ─────────────────────────────
 
 def compute_per_image_stats(model, run_dir: Path,
                              score_threshold: float = None,
-                             merge_dunes: bool = False) -> list[dict]:
+                             class_mode: str = classes.DEFAULT_MODE) -> list[dict]:
     """
     For every source image (across all splits):
       - GT counts from annotation file
@@ -164,9 +211,10 @@ def compute_per_image_stats(model, run_dir: Path,
     Writes run_dir/per_image_stats.json and returns the list.
     """
     score_threshold = score_threshold or config.SCORE_THRESHOLD
-    _raw_dune_labels = {'CoR_dune_down', 'CoR_dune_up'}
-    labels_to_report = ['CoR_dune'] if merge_dunes else config.LABELS
-    idx_to_label     = {1: 'CoR_dune'} if merge_dunes else IDX_TO_LABEL
+    labels_to_report = classes.labels_of(class_mode)
+    idx_to_label     = classes.idx_to_label(class_mode)
+    # annotation label -> reported class name, for this mode
+    label_map        = classes.CLASS_MODES[class_mode][1]
 
     split_index = splits.resolve(verbose=False)
 
@@ -196,11 +244,8 @@ def compute_per_image_stats(model, run_dir: Path,
         gt_counts: dict[str, int] = defaultdict(int)
         for shape in ann['shapes']:
             lbl = shape['label']
-            if merge_dunes:
-                if lbl in _raw_dune_labels:
-                    gt_counts['CoR_dune'] += 1
-            elif lbl in LABEL_TO_IDX:
-                gt_counts[lbl] += 1
+            if lbl in label_map:
+                gt_counts[label_map[lbl]] += 1
 
         # ── full-image inference ─────────────────────────────────────────
         img_gray = open_as_uint8(img_path)
@@ -265,18 +310,19 @@ def compute_per_image_stats(model, run_dir: Path,
 
 # ── convenience: evaluate all splits ─────────────────────────────────────────
 
-def evaluate_all_splits(model, device, run_dir: Path, merge_dunes: bool = False) -> dict:
+def evaluate_all_splits(model, device, run_dir: Path,
+                        class_mode: str = classes.DEFAULT_MODE) -> dict:
     """
     Compute mAP on train / val / test and write run_dir/metrics.json.
     """
     from dataset import TileDataset
 
-    idx_to_label = {1: 'CoR_dune'} if merge_dunes else IDX_TO_LABEL
+    idx_to_label = classes.idx_to_label(class_mode)
 
     all_metrics = {}
     for split in ('train', 'val', 'test'):
         print(f"\nEvaluating {split} split …")
-        ds = TileDataset(split, augment=False, merge_dunes=merge_dunes)
+        ds = TileDataset(split, augment=False, class_mode=class_mode)
         all_metrics[split] = compute_map(model, ds, device, idx_to_label=idx_to_label)
         m = all_metrics[split]
         print(f"  mAP@0.5 = {m['mAP']:.4f}")
