@@ -25,8 +25,9 @@ TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 RANDOM_SEED = 42
-SPLIT_LEVEL = 'image'  # 'image' | 'tile' — see splits.py
-SPLIT_GUARD = True     # drop tiles straddling a split boundary (tile level only)
+SPLIT_LEVEL = 'image'  # 'image' | 'region' | 'tile' — see splits.py
+SPLIT_GUARD = True     # drop tiles straddling a split boundary (region/tile levels)
+SPLIT_BLOCK = 2        # region split: block edge in tiles (2 -> 4x4 blocks per image)
 
 # Training
 BATCH_SIZE = 24
