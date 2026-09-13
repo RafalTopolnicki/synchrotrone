@@ -1,16 +1,17 @@
 """
-Tiles source images, clips annotations to each tile, and writes a split index.
+Tiles source images, clips annotations to each tile, and writes a flat tile
+index to DATA/tiles_index.json.
 
-Splits are done at the base-image level: FH020_step0_0_0002 and
-FH020_step0_0_0002_sat are considered the same base image and always land in
-the same split, preventing data leakage through augmented variants.
+This step knows nothing about train/val/test: splitting is a training-time
+decision and lives in splits.py, so a different split can be tried without
+re-cutting a single tile.
 
-Run once before training:
+Run once per change to the images or annotations:
     python data_prep.py
 """
 
+import argparse
 import json
-import random
 from pathlib import Path
 import numpy as np
 from PIL import Image
@@ -70,7 +71,30 @@ def clip_box_to_tile(box, tx, ty, tile_size):
     return cx1 - tx, cy1 - ty, cx2 - tx, cy2 - ty
 
 
+def report_index(records: list[dict]) -> None:
+    idx_to_label = {i + 1: l for i, l in enumerate(config.LABELS)}
+    counts: dict[str, int] = {}
+    for r in records:
+        for l in r['labels']:
+            counts[idx_to_label[l]] = counts.get(idx_to_label[l], 0) + 1
+
+    n_ann = sum(1 for r in records if r['labels'])
+    n_img = len({r['source_image'] for r in records})
+    n_base = len({r['base'] for r in records})
+    print(f"\n{len(records)} tiles ({n_ann} with annotations) from {n_img} images "
+          f"({n_base} base images)")
+    for l in config.LABELS:
+        print(f"  {l:16s} {counts.get(l, 0):6d}")
+    missing = [l for l in config.LABELS if not counts.get(l)]
+    if missing:
+        print(f"  WARNING: no instances of {', '.join(missing)} anywhere in the dataset")
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.parse_args()
+
     config.TILES_DIR.mkdir(parents=True, exist_ok=True)
     config.CHECKPOINTS_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -78,96 +102,67 @@ def main():
     if not ann_files:
         raise FileNotFoundError(f"No annotation JSONs found in {config.ANNOTATIONS_DIR}")
 
-    # Group annotation files by base image name
-    groups: dict[str, list[Path]] = {}
-    for af in ann_files:
-        groups.setdefault(get_base_name(af.name), []).append(af)
-
-    base_names = sorted(groups)
-    random.seed(config.RANDOM_SEED)
-    random.shuffle(base_names)
-
-    n = len(base_names)
-    n_train = max(1, round(n * config.TRAIN_RATIO))
-    n_val = max(1, round(n * config.VAL_RATIO))
-
-    split_map = (
-        {b: 'train' for b in base_names[:n_train]}
-        | {b: 'val'   for b in base_names[n_train:n_train + n_val]}
-        | {b: 'test'  for b in base_names[n_train + n_val:]}
-    )
-
-    train_n = sum(1 for s in split_map.values() if s == 'train')
-    val_n   = sum(1 for s in split_map.values() if s == 'val')
-    test_n  = sum(1 for s in split_map.values() if s == 'test')
-    print(f"Base-image split: {train_n} train / {val_n} val / {test_n} test")
-    print(f"  train: {[b for b,s in split_map.items() if s=='train']}")
-    print(f"  val:   {[b for b,s in split_map.items() if s=='val']}")
-    print(f"  test:  {[b for b,s in split_map.items() if s=='test']}")
-
     label_to_idx = {l: i + 1 for i, l in enumerate(config.LABELS)}
-    tile_index: dict[str, list] = {'train': [], 'val': [], 'test': []}
+    records: list[dict] = []
 
-    for base, file_list in groups.items():
-        split = split_map[base]
+    # ── tile every image ──────────────────────────────────────────────────────────────
+    for ann_file in ann_files:
+        stem = ann_file.stem
+        img_path = config.IMAGES_DIR / f'{stem}.png'
+        if not img_path.exists():
+            print(f"  WARNING: image not found: {img_path}, skipping")
+            continue
 
-        for ann_file in sorted(file_list):
-            stem = ann_file.stem
-            img_path = config.IMAGES_DIR / f'{stem}.png'
-            if not img_path.exists():
-                print(f"  WARNING: image not found: {img_path}, skipping")
+        with open(ann_file) as f:
+            ann = json.load(f)
+
+        boxes_raw = []
+        for shape in ann['shapes']:
+            lbl = shape['label']
+            if lbl not in label_to_idx:
                 continue
+            boxes_raw.append((label_to_idx[lbl], labelme_rect_to_xyxy(shape['points'])))
 
-            with open(ann_file) as f:
-                ann = json.load(f)
+        img = open_as_uint8(img_path)
+        W, H = img.size
+        xs = tile_positions(W, config.TILE_SIZE, config.STRIDE)
+        ys = tile_positions(H, config.TILE_SIZE, config.STRIDE)
 
-            boxes_raw = []
-            for shape in ann['shapes']:
-                lbl = shape['label']
-                if lbl not in label_to_idx:
-                    continue
-                boxes_raw.append((label_to_idx[lbl], labelme_rect_to_xyxy(shape['points'])))
+        n_tiles = 0
+        for ty in ys:
+            for tx in xs:
+                tile_img = img.crop((tx, ty, tx + config.TILE_SIZE, ty + config.TILE_SIZE))
 
-            img = open_as_uint8(img_path)
-            W, H = img.size
-            xs = tile_positions(W, config.TILE_SIZE, config.STRIDE)
-            ys = tile_positions(H, config.TILE_SIZE, config.STRIDE)
+                tile_boxes, tile_labels = [], []
+                for cls_idx, box in boxes_raw:
+                    clipped = clip_box_to_tile(box, tx, ty, config.TILE_SIZE)
+                    if clipped is not None:
+                        tile_boxes.append(list(clipped))
+                        tile_labels.append(cls_idx)
 
-            n_tiles = 0
-            for ty in ys:
-                for tx in xs:
-                    tile_img = img.crop((tx, ty, tx + config.TILE_SIZE, ty + config.TILE_SIZE))
+                tile_name = f'{stem}_tx{tx}_ty{ty}.png'
+                tile_img.save(config.TILES_DIR / tile_name)
 
-                    tile_boxes, tile_labels = [], []
-                    for cls_idx, box in boxes_raw:
-                        clipped = clip_box_to_tile(box, tx, ty, config.TILE_SIZE)
-                        if clipped is not None:
-                            tile_boxes.append(list(clipped))
-                            tile_labels.append(cls_idx)
+                records.append({
+                    'tile_path': str(config.TILES_DIR / tile_name),
+                    'source_image': stem,
+                    'base': get_base_name(ann_file.name),
+                    'tx': tx,
+                    'ty': ty,
+                    'boxes': tile_boxes,
+                    'labels': tile_labels,
+                })
+                n_tiles += 1
 
-                    tile_name = f'{stem}_tx{tx}_ty{ty}.png'
-                    tile_img.save(config.TILES_DIR / tile_name)
+        print(f"  {stem}: {n_tiles} tiles, {len(boxes_raw)} annotations")
 
-                    tile_index[split].append({
-                        'tile_path': str(config.TILES_DIR / tile_name),
-                        'source_image': stem,
-                        'tx': tx,
-                        'ty': ty,
-                        'boxes': tile_boxes,
-                        'labels': tile_labels,
-                    })
-                    n_tiles += 1
+    with open(config.TILES_INDEX_FILE, 'w') as f:
+        json.dump(records, f)
 
-            print(f"  [{split}] {stem}: {n_tiles} tiles, {len(boxes_raw)} annotations")
-
-    with open(config.SPLITS_FILE, 'w') as f:
-        json.dump(tile_index, f)
-
-    print()
-    for split, tiles in tile_index.items():
-        n_ann = sum(1 for t in tiles if t['labels'])
-        print(f"{split:5s}: {len(tiles):4d} tiles  ({n_ann} with annotations)")
-    print(f"\nSplit index saved to {config.SPLITS_FILE}")
+    report_index(records)
+    print(f"\nTile index saved to {config.TILES_INDEX_FILE}")
+    print("Splits are assigned at training time \u2014 see splits.py "
+          "(`python splits.py` to preview one).")
 
 
 if __name__ == '__main__':

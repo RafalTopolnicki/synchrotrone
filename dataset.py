@@ -1,4 +1,3 @@
-import json
 import random
 import torch
 from torch.utils.data import Dataset
@@ -7,6 +6,7 @@ import torchvision.transforms as T
 import torchvision.transforms.functional as TF
 
 import config
+import splits
 
 # Color augmentations applied to training tiles only.
 # Grayscale images are replicated to 3 channels, so saturation/hue are skipped.
@@ -23,9 +23,7 @@ _DUNE_UP_IDX   = config.LABELS.index('CoR_dune_up')   + 1
 
 class TileDataset(Dataset):
     def __init__(self, split: str, augment: bool = False, merge_dunes: bool = False, rot180: bool = False):
-        with open(config.SPLITS_FILE) as f:
-            index = json.load(f)
-        self.tiles = index[split]
+        self.tiles = splits.load(split)
         self.augment = augment
         self.merge_dunes = merge_dunes
         self.rot180 = rot180

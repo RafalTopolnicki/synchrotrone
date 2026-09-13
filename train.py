@@ -36,6 +36,7 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 import config
+import splits
 from dataset import TileDataset
 from model import build_model, BACKBONES
 from viz import log_sample_images, save_prediction_tiles
@@ -120,6 +121,26 @@ class EarlyStopping:
 
 # ── main ──────────────────────────────────────────────────────────────────────
 
+def inherit_split_policy(resume_path: str) -> dict | None:
+    """Split policy recorded by the run that produced a checkpoint.
+
+    Re-evaluating a checkpoint under a freshly rolled split would score it on
+    tiles it was trained on, so an --eval_only run reuses the original policy
+    unless the split flags are given explicitly.
+    """
+    for parent in Path(resume_path).resolve().parents:
+        args_file = parent / 'args.json'
+        if args_file.exists():
+            policy = json.loads(args_file.read_text()).get('split_policy')
+            if policy:
+                print(f"Inheriting split policy from {args_file}: {splits.describe(policy)}")
+                return policy
+            return None
+    print(f"WARNING: no args.json found near {resume_path}; "
+          f"using the split policy from the command line / config")
+    return None
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--backbone',    default='resnet50v2',
@@ -155,7 +176,20 @@ def main():
                         help='Minimum score for a box to be kept (box_score_thresh in Faster R-CNN)')
     parser.add_argument('--eval_only', action='store_true',
                         help='Skip training; load --resume checkpoint and run evaluation only')
+    splits.add_cli_args(parser)
     args = parser.parse_args()
+
+    # ── split policy ───────────────────────────────────────────────────────
+    # Resolved once, before any dataset is built, so train/val/test agree.
+    policy_args = splits.policy_from_args(args)
+    if args.eval_only and args.resume:
+        inherited = inherit_split_policy(args.resume)
+        if inherited:
+            policy_args = {k: (v if v is not None else inherited.get(k))
+                           for k, v in policy_args.items()}
+    split_index = splits.resolve(**policy_args)
+    splits.report(split_index)
+    args.split_policy = splits.active_policy()
 
     # ── run directory ──────────────────────────────────────────────────────
     run_name = f"{datetime.now().strftime('%Y%m%d_%H%M%S')}_{args.backbone}"

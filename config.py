@@ -6,7 +6,8 @@ DATA_DIR = ROOT / 'DATA'
 ANNOTATIONS_DIR = DATA_DIR / 'annotations'
 IMAGES_DIR = DATA_DIR
 TILES_DIR = DATA_DIR / 'tiles'
-SPLITS_FILE = DATA_DIR / 'splits.json'
+TILES_INDEX_FILE = DATA_DIR / 'tiles_index.json'  # written by data_prep.py
+SPLITS_FILE = DATA_DIR / 'splits.json'           # cache of the last resolved split
 CHECKPOINTS_DIR = ROOT / 'checkpoints'
 
 LABELS = ['CoR_circle_ok', 'CoR_dune_down', 'CoR_dune_up', 'CoR_line']
@@ -24,6 +25,8 @@ TRAIN_RATIO = 0.70
 VAL_RATIO = 0.15
 TEST_RATIO = 0.15
 RANDOM_SEED = 42
+SPLIT_LEVEL = 'image'  # 'image' | 'tile' — see splits.py
+SPLIT_GUARD = True     # drop tiles straddling a split boundary (tile level only)
 
 # Training
 BATCH_SIZE = 24

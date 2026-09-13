@@ -18,6 +18,7 @@ from PIL import Image
 from tqdm import tqdm
 
 import config
+import splits
 from data_prep import tile_positions, open_as_uint8
 
 IDX_TO_LABEL = {i + 1: l for i, l in enumerate(config.LABELS)}
@@ -167,8 +168,7 @@ def compute_per_image_stats(model, run_dir: Path,
     labels_to_report = ['CoR_dune'] if merge_dunes else config.LABELS
     idx_to_label     = {1: 'CoR_dune'} if merge_dunes else IDX_TO_LABEL
 
-    with open(config.SPLITS_FILE) as f:
-        split_index = json.load(f)
+    split_index = splits.resolve(verbose=False)
 
     # source_image → split
     image_to_split: dict[str, str] = {}
